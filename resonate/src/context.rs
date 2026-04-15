@@ -899,16 +899,13 @@ impl<'ctx, T> PromiseTask<'ctx, T> {
     /// Attach data to the promise param (visible to external resolvers).
     ///
     /// Must be called before `.id()`, `.await`, or `.create()`.
-    pub fn data(mut self, data: &impl Serialize) -> Self {
+    pub fn data(mut self, data: &impl Serialize) -> Result<Self> {
         debug_assert!(
             self.record.get().is_none(),
             "cannot set data after promise creation"
         );
-        self.req.param = Value {
-            headers: None,
-            data: Some(serde_json::to_value(data).unwrap_or(serde_json::Value::Null)),
-        };
-        self
+        self.req.param = Value::from_serializable(data)?;
+        Ok(self)
     }
 
     /// Returns the promise ID, creating the durable promise if it hasn't been yet.
