@@ -55,12 +55,7 @@ impl Promises {
         self.settle(id, SettleState::RejectedCanceled, value).await
     }
 
-    async fn settle(
-        &self,
-        id: &str,
-        state: SettleState,
-        value: Value,
-    ) -> Result<PromiseRecord> {
+    async fn settle(&self, id: &str, state: SettleState, value: Value) -> Result<PromiseRecord> {
         self.sender
             .promise_settle(PromiseSettleReq {
                 id: id.to_string(),
@@ -71,12 +66,10 @@ impl Promises {
     }
 
     /// Register a listener on a promise so `address` is notified when it settles.
-    pub async fn register_listener(
-        &self,
-        awaited: &str,
-        address: &str,
-    ) -> Result<PromiseRecord> {
-        self.sender.promise_register_listener(awaited, address).await
+    pub async fn register_listener(&self, awaited: &str, address: &str) -> Result<PromiseRecord> {
+        self.sender
+            .promise_register_listener(awaited, address)
+            .await
     }
 
     /// Search for promises matching optional state/tags filters.

@@ -368,7 +368,9 @@ async fn promises_resolve_roundtrip() {
     .unwrap();
 
     let payload = Value::from_serializable(serde_json::json!({"ok": true})).unwrap();
-    let settled = with_timeout(r.promises.resolve(&id, payload)).await.unwrap();
+    let settled = with_timeout(r.promises.resolve(&id, payload))
+        .await
+        .unwrap();
     assert_eq!(settled.state, PromiseState::Resolved);
 
     let fetched = with_timeout(r.promises.get(&id)).await.unwrap();
@@ -554,13 +556,10 @@ async fn schedules_search() {
     let id = unique_id("sched-search");
     let promise_tpl = format!("{id}.{{{{.timestamp}}}}");
 
-    with_timeout(r.schedules.create(
-        &id,
-        "0 * * * *",
-        &promise_tpl,
-        60_000,
-        Value::default(),
-    ))
+    with_timeout(
+        r.schedules
+            .create(&id, "0 * * * *", &promise_tpl, 60_000, Value::default()),
+    )
     .await
     .unwrap();
 
