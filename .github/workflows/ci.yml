@@ -49,7 +49,7 @@ jobs:
         run: |
           docker run -d --name resonate \
             -p 8001:8001 \
-            resonatehq/resonate:latest serve
+            resonatehqio/resonate:latest
           for i in $(seq 1 60); do
             if curl -sf http://localhost:8001/promises >/dev/null 2>&1 \
                || curl -sf http://localhost:8001/ >/dev/null 2>&1; then
