@@ -6,7 +6,7 @@ The Resonate Rust SDK lets you build reliable, distributed applications using Ru
 Built on [tokio](https://tokio.rs), it gives you durable execution with automatic recovery, idempotency, and distributed coordination — without the infrastructure headache.
 
 **Resonate** is a durable execution engine.
-Write your business logic as normal async Rust functions, annotate them with `#[resonate_sdk::function]`, and Resonate handles retries, recovery, and replay.
+Write your business logic as normal async Rust functions, annotate them with `#[resonate::function]`, and Resonate handles retries, recovery, and replay.
 If your process crashes mid-workflow, execution resumes from the last checkpoint — not from the beginning.
 
 ## Links
@@ -18,8 +18,11 @@ If your process crashes mid-workflow, execution resumes from the last checkpoint
 
 ## Installation
 
+The Rust SDK is currently git-only — it isn't on crates.io yet. Add it as a git dependency, renaming the package to `resonate` for shorter imports (the convention used in our [examples](https://github.com/resonatehq-examples) and [docs](https://docs.resonatehq.io/develop/rust)):
+
 ```bash
-cargo add resonate-sdk tokio --features tokio/full
+cargo add resonate-sdk --rename resonate --git https://github.com/resonatehq/resonate-sdk-rs --branch main
+cargo add tokio --features tokio/full
 cargo add serde --features derive
 ```
 
@@ -27,33 +30,28 @@ Or add to your `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-resonate-sdk = "0.1"
+resonate = { package = "resonate-sdk", git = "https://github.com/resonatehq/resonate-sdk-rs", branch = "main" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-To track the latest development version, use a git dependency:
-
-```toml
-[dependencies]
-resonate-sdk = { git = "https://github.com/resonatehq/resonate-sdk-rust", branch = "main" }
-```
+Once the SDK is published to crates.io, this will become `resonate = { package = "resonate-sdk", version = "0.4" }`.
 
 ## Quick example
 
 ```rust
-use resonate_sdk::prelude::*;
+use resonate::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // A workflow function — receives &Context for durable sub-task orchestration.
-#[resonate_sdk::function]
+#[resonate::function]
 async fn greet(ctx: &Context, name: String) -> Result<String> {
     let greeting = ctx.run(format_greeting, name).await?;
     Ok(greeting)
 }
 
 // A leaf function — pure computation, no Context needed.
-#[resonate_sdk::function]
+#[resonate::function]
 async fn format_greeting(name: String) -> Result<String> {
     Ok(format!("Hello, {}!", name))
 }
@@ -84,7 +82,7 @@ Run a server with `resonate dev` (install via `brew install resonatehq/tap/reson
 Use `.spawn()` to fan out durable tasks in parallel:
 
 ```rust
-#[resonate_sdk::function]
+#[resonate::function]
 async fn fan_out(ctx: &Context) -> Result<Vec<String>> {
     // Spawn tasks in parallel
     let h1 = ctx.run(process, "alpha".into()).spawn().await?;
@@ -148,7 +146,7 @@ Client-side builders (`resonate.run()`, `resonate.rpc()`) additionally support:
 
 ### Function annotation
 
-`#[resonate_sdk::function]` detects the function kind from the first parameter:
+`#[resonate::function]` detects the function kind from the first parameter:
 
 | First parameter | Kind | Description |
 |---|---|---|
