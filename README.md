@@ -35,10 +35,10 @@ brew install resonatehq/tap/resonate
 
 2. Install the Resonate SDK
 
-The SDK is currently git-only (not yet on crates.io). Add it as a git dependency, renaming the package to `resonate` for shorter imports — the convention used in our [examples](https://github.com/resonatehq-examples) and [docs](https://docs.resonatehq.io/develop/rust):
+The SDK ships on crates.io as `resonate-sdk`. We rename it to `resonate` for shorter imports — the convention used in our [examples](https://github.com/resonatehq-examples) and [docs](https://docs.resonatehq.io/develop/rust):
 
 ```shell
-cargo add resonate-sdk --rename resonate --git https://github.com/resonatehq/resonate-sdk-rs --branch main
+cargo add resonate-sdk --rename resonate
 cargo add tokio --features full
 cargo add serde --features derive
 ```
@@ -47,12 +47,12 @@ Or add to your `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-resonate = { package = "resonate-sdk", git = "https://github.com/resonatehq/resonate-sdk-rs", branch = "main" }
+resonate = { package = "resonate-sdk", version = "0.4" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-When the SDK ships on crates.io this becomes `resonate = { package = "resonate-sdk", version = "0.4" }`.
+To track the latest development version, swap the version pin for a git dependency: `git = "https://github.com/resonatehq/resonate-sdk-rs", branch = "main"`.
 
 3. Write your first Resonate Function
 
