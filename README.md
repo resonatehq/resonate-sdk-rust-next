@@ -35,28 +35,41 @@ brew install resonatehq/tap/resonate
 
 2. Install the Resonate SDK
 
+The SDK is currently git-only (not yet on crates.io). Add it as a git dependency, renaming the package to `resonate` for shorter imports — the convention used in our [examples](https://github.com/resonatehq-examples) and [docs](https://docs.resonatehq.io/develop/rust):
+
 ```shell
-cargo add resonate-sdk
+cargo add resonate-sdk --rename resonate --git https://github.com/resonatehq/resonate-sdk-rs --branch main
 cargo add tokio --features full
 cargo add serde --features derive
 ```
+
+Or add to your `Cargo.toml` directly:
+
+```toml
+[dependencies]
+resonate = { package = "resonate-sdk", git = "https://github.com/resonatehq/resonate-sdk-rs", branch = "main" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+When the SDK ships on crates.io this becomes `resonate = { package = "resonate-sdk", version = "0.4" }`.
 
 3. Write your first Resonate Function
 
 A greeting as a durable workflow. Trivial, but the function survives process restarts mid-execution.
 
 ```rust
-use resonate_sdk::prelude::*;
+use resonate::prelude::*;
 
 // A workflow function — receives &Context for durable sub-task orchestration.
-#[resonate_sdk::function]
+#[resonate::function]
 async fn greet(ctx: &Context, name: String) -> Result<String> {
     let greeting = ctx.run(format_greeting, name).await?;
     Ok(greeting)
 }
 
 // A leaf function — pure computation, no Context needed.
-#[resonate_sdk::function]
+#[resonate::function]
 async fn format_greeting(name: String) -> Result<String> {
     let greeting = format!("Hello, {name}! Welcome to durable execution.");
     println!("{greeting}");
