@@ -57,8 +57,7 @@ pub struct ResonateSchedule {
 impl ResonateSchedule {
     /// Delete this schedule.
     pub async fn delete(self) -> Result<()> {
-        self.schedules.delete(&self.name).await?;
-        Ok(())
+        self.schedules.delete(&self.name).await
     }
 }
 
@@ -104,15 +103,33 @@ impl Resonate {
 
     /// Local-only mode. No external dependencies. In-memory state.
     /// group="default", pid="default", ttl=MAX, no heartbeat.
+    ///
+    /// Always uses an in-process `LocalNetwork`, regardless of
+    /// `RESONATE_URL`/`RESONATE_HOST` — local must mean local.
     pub fn local() -> Self {
-        let config = ResonateConfig {
-            pid: Some("default".to_string()),
-            group: Some("default".to_string()),
-            ttl: Some(u64::MAX),
-            encryptor: None,
-            ..Default::default()
-        };
-        Self::new(config)
+        Self::local_with(ResonateConfig::default())
+    }
+
+    /// Local-only mode with caller-supplied config (prefix, pid, ttl, etc.).
+    ///
+    /// Like [`Resonate::local`], this always uses an in-process
+    /// `LocalNetwork` — `config.url` and any `RESONATE_URL`/`RESONATE_HOST`
+    /// env vars are ignored. Use this in tests or local-mode applications
+    /// that need to set fields like `prefix` while staying off the network.
+    pub fn local_with(config: ResonateConfig) -> Self {
+        let pid = config.pid.or_else(|| Some("default".to_string()));
+        let group = config.group.or_else(|| Some("default".to_string()));
+        let net: Arc<dyn Network> = Arc::new(LocalNetwork::new(pid.clone(), group.clone()));
+        Self::new(ResonateConfig {
+            url: None,
+            pid,
+            group,
+            ttl: config.ttl.or(Some(u64::MAX)),
+            token: config.token,
+            encryptor: config.encryptor,
+            network: Some(net),
+            prefix: config.prefix,
+        })
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -212,8 +229,8 @@ impl Resonate {
             core_ttl,
             deps.clone(),
         ));
-        let promises = Promises::new(transport.clone());
-        let schedules = Schedules::new(transport.clone());
+        let promises = Promises::new(sender.clone(), codec.clone());
+        let schedules = Schedules::new(sender.clone(), codec.clone());
 
         let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
         let subscribe_every = Duration::from_secs(60);
@@ -423,13 +440,8 @@ impl Resonate {
             .await?;
 
         match outcome {
-            TaskCreateOutcome::Conflict(promise) => {
-                // Promise already exists — register listener and return handle
-                self.create_handle_from_record(prefixed_id, &promise).await
-            }
+            TaskCreateOutcome::Conflict => self.create_handle_from_id(prefixed_id).await,
             TaskCreateOutcome::Created(result) => {
-                let promise = &result.promise;
-
                 // If task is acquired, fire-and-forget core execution
                 if result.task.state == crate::types::TaskState::Acquired {
                     let task_id = result.task.id.clone();
@@ -467,7 +479,7 @@ impl Resonate {
                     });
                 }
 
-                self.create_handle_from_record(prefixed_id, promise).await
+                self.create_handle_from_id(prefixed_id).await
             }
         }
     }
@@ -481,15 +493,14 @@ impl Resonate {
         opts: Options,
     ) -> Result<ResonateHandle<T>> {
         let (prefixed_id, req) = self.build_promise_create_req(id, func_name, args, &opts)?;
-        let promise = self.sender.promise_create(req).await?;
-        self.create_handle_from_record(prefixed_id, &promise).await
+        self.sender.promise_create(req).await?;
+        self.create_handle_from_id(prefixed_id).await
     }
 
     /// Get a handle to an existing promise.
     pub async fn get<T: DeserializeOwned>(&self, id: &str) -> Result<ResonateHandle<T>> {
         let prefixed_id = self.prefix_id(id);
-        let promise = self.sender.promise_get(&prefixed_id).await?;
-        self.create_handle_from_record(prefixed_id, &promise).await
+        self.create_handle_from_id(prefixed_id).await
     }
 
     /// Create a schedule for periodic function execution. Returns a builder
@@ -613,7 +624,16 @@ impl Resonate {
                         .get("state")
                         .and_then(|v| v.as_str())
                         .unwrap_or("pending");
-                    let value = promise.get("value").cloned().unwrap_or_default();
+                    let raw_value = promise.get("value").cloned().unwrap_or_default();
+                    // Normalize into {data, headers} wire shape so handle decoding
+                    // works regardless of whether the server emits a structured
+                    // Value or a bare scalar/object.
+                    let value = match <crate::types::Value as serde::Deserialize>::deserialize(
+                        &raw_value,
+                    ) {
+                        Ok(v) => Self::value_to_wire_json(&v),
+                        Err(_) => raw_value,
+                    };
 
                     let result = Arc::new(PromiseResult {
                         state: Resonate::parse_promise_state(state_str),
@@ -700,47 +720,35 @@ impl Resonate {
         serde_json::Value::Object(map)
     }
 
-    /// Create a handle from a typed PromiseRecord.
-    async fn create_handle_from_record<T: DeserializeOwned>(
+    /// Build a handle for a promise that lives on the server.
+    ///
+    /// Subscribes to the id under the local subscriptions map, then registers
+    /// a unicast listener with the server. The listener call returns the
+    /// current `PromiseRecord` — already-settled promises are written into
+    /// the watch channel immediately; pending promises await an `unblock`
+    /// SSE. Inserting the subs entry before calling `register_listener`
+    /// keeps an early `unblock` from being dropped.
+    async fn create_handle_from_id<T: DeserializeOwned>(
         &self,
         id: String,
-        promise: &crate::types::PromiseRecord,
     ) -> Result<ResonateHandle<T>> {
-        let wire_value = Self::value_to_wire_json(&promise.value);
-        let settled = if promise.state == PromiseState::Pending {
-            None
-        } else {
-            Some(Arc::new(PromiseResult {
-                state: promise.state.clone(),
-                value: wire_value,
-            }))
-        };
-        let is_pending = promise.state == PromiseState::Pending;
-
         let (rx, needs_listener) = {
             let mut subs = self.subscriptions.lock().await;
             if let Some(tx) = subs.get(&id) {
-                // Existing entry — another handle or early Unblock.
                 (tx.subscribe(), false)
             } else {
-                // First time — create watch channel.
-                // If already settled, pre-load the value.
-                let (tx, rx) = watch::channel(settled);
+                let (tx, rx) = watch::channel(None);
                 subs.insert(id.clone(), tx);
-                (rx, is_pending)
+                (rx, true)
             }
         };
-        // Lock released.
 
-        // Register listener so the server pushes Unblock to us.
-        // Only needed on first subscription for a pending promise.
         if needs_listener {
-            let resp_promise = self.register_listener(&id).await?;
-            if resp_promise.state != PromiseState::Pending {
-                // Settled between promise creation and listener registration.
+            let promise = self.register_listener(&id).await?;
+            if promise.state != PromiseState::Pending {
                 let result = Arc::new(PromiseResult {
-                    state: resp_promise.state,
-                    value: Self::value_to_wire_json(&resp_promise.value),
+                    state: promise.state,
+                    value: Self::value_to_wire_json(&promise.value),
                 });
                 let subs = self.subscriptions.lock().await;
                 if let Some(tx) = subs.get(&id) {
@@ -1025,7 +1033,7 @@ impl<'a, Args: Serialize + Send + 'a> IntoFuture for ResScheduleTask<'a, Args> {
                     self.cron,
                     &template,
                     timeout.as_millis() as i64,
-                    serde_json::to_value(&encoded_param)?,
+                    encoded_param,
                 )
                 .await?;
 
@@ -1088,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_with_custom_pid_and_group() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             pid: Some("worker-1".into()),
             group: Some("workers".into()),
             ..Default::default()
@@ -1100,7 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_with_prefix() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             pid: Some("test".into()),
             group: Some("g1".into()),
             ttl: Some(30_000),
@@ -1114,7 +1122,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_with_empty_prefix() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             prefix: Some("".into()),
             ..Default::default()
         });
@@ -1123,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_with_custom_ttl() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             ttl: Some(120_000),
             ..Default::default()
         });
@@ -1203,7 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_spawn_with_prefix_prepends_to_id() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             prefix: Some("app".into()),
             pid: Some("default".into()),
             ..Default::default()
@@ -1286,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_spawn_with_prefix() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             prefix: Some("svc".into()),
             ..Default::default()
         });
@@ -1360,7 +1368,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_with_prefix_prepends_prefix() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             prefix: Some("ns".into()),
             ..Default::default()
         });
@@ -1578,7 +1586,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_is_prepended_with_colon() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             prefix: Some("prefix".into()),
             ..Default::default()
         });
@@ -1590,7 +1598,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_applied_consistently_to_run_rpc_and_get() {
-        let r = Resonate::new(ResonateConfig {
+        let r = Resonate::local_with(ResonateConfig {
             prefix: Some("p".into()),
             ..Default::default()
         });
@@ -1703,8 +1711,9 @@ mod tests {
             .create(
                 "sub-p1",
                 i64::MAX,
-                serde_json::json!({"data": "test"}),
-                serde_json::json!({}),
+                crate::types::Value::from_serializable(serde_json::json!({"data": "test"}))
+                    .unwrap(),
+                HashMap::new(),
             )
             .await;
         assert!(created.is_ok());
@@ -1712,7 +1721,7 @@ mod tests {
         // Get it back
         let fetched = r.promises.get("sub-p1").await;
         assert!(fetched.is_ok());
-        assert_eq!(fetched.unwrap()["id"], "sub-p1");
+        assert_eq!(fetched.unwrap().id, "sub-p1");
     }
 
     #[tokio::test]
@@ -1724,21 +1733,25 @@ mod tests {
             .create(
                 "sub-p2",
                 i64::MAX,
-                serde_json::json!(null),
-                serde_json::json!({}),
+                crate::types::Value::default(),
+                HashMap::new(),
             )
             .await
             .unwrap();
 
         let settled = r
             .promises
-            .resolve("sub-p2", serde_json::json!({"data": "result"}))
+            .resolve(
+                "sub-p2",
+                crate::types::Value::from_serializable(serde_json::json!({"data": "result"}))
+                    .unwrap(),
+            )
             .await;
         assert!(settled.is_ok());
 
         // Verify it's settled
         let fetched = r.promises.get("sub-p2").await.unwrap();
-        assert_eq!(fetched["state"], "resolved");
+        assert_eq!(fetched.state, PromiseState::Resolved);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1964,8 +1977,8 @@ mod tests {
             .create(
                 "early-unblock",
                 i64::MAX,
-                serde_json::json!(null),
-                serde_json::json!({}),
+                crate::types::Value::default(),
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -2046,7 +2059,7 @@ mod tests {
         // Settle the promise — the local network will dispatch an Unblock
         // message through the transport to our watch channel.
         r.promises
-            .resolve("e2e-1", serde_json::json!(null))
+            .resolve("e2e-1", crate::types::Value::default())
             .await
             .unwrap();
 
@@ -2072,7 +2085,7 @@ mod tests {
 
         // Settle — Unblock flows through transport → watch → both receivers
         r.promises
-            .resolve("e2e-multi", serde_json::json!(null))
+            .resolve("e2e-multi", crate::types::Value::default())
             .await
             .unwrap();
 
@@ -2096,7 +2109,7 @@ mod tests {
 
         // Reject the promise
         r.promises
-            .reject("e2e-reject", serde_json::json!(null))
+            .reject("e2e-reject", crate::types::Value::default())
             .await
             .unwrap();
 
@@ -2115,13 +2128,13 @@ mod tests {
             .create(
                 "e2e-pre",
                 i64::MAX,
-                serde_json::json!(null),
-                serde_json::json!({}),
+                crate::types::Value::default(),
+                HashMap::new(),
             )
             .await
             .unwrap();
         r.promises
-            .resolve("e2e-pre", serde_json::json!(null))
+            .resolve("e2e-pre", crate::types::Value::default())
             .await
             .unwrap();
 
@@ -2147,7 +2160,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             promises
-                .resolve("e2e-block", serde_json::json!(null))
+                .resolve("e2e-block", crate::types::Value::default())
                 .await
                 .unwrap();
         });
@@ -2373,6 +2386,141 @@ mod tests {
 
         let result: String = r.run("di-multi", read_two_deps, ()).await.unwrap();
         assert_eq!(result, "multi:42");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Detached (fire-and-forget) Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[resonate_sdk_macros::function]
+    async fn detacher_one(ctx: &Context) -> Result<String> {
+        let id = ctx.detached("remote_handler", (42_i64,)).spawn().await?;
+        Ok(id)
+    }
+
+    #[resonate_sdk_macros::function]
+    async fn detacher_many(ctx: &Context) -> Result<Vec<String>> {
+        let a = ctx.detached("h", (1_i64,)).spawn().await?;
+        let b = ctx.detached("h", (2_i64,)).spawn().await?;
+        let c = ctx.detached("h", (3_i64,)).spawn().await?;
+        Ok(vec![a, b, c])
+    }
+
+    #[resonate_sdk_macros::function]
+    async fn detacher_with_target(ctx: &Context) -> Result<String> {
+        let id = ctx
+            .detached("remote_handler", (1_i64,))
+            .target("custom-worker")
+            .spawn()
+            .await?;
+        Ok(id)
+    }
+
+    #[tokio::test]
+    async fn e2e_detached_returns_bounded_id_under_origin() {
+        let r = Resonate::local();
+        r.register(detacher_one).unwrap();
+
+        let id: String = r.run("e2e-det", detacher_one, ()).await.unwrap();
+
+        // Format: "{origin}.{16 hex chars}"
+        let prefix = "e2e-det.";
+        assert!(id.starts_with(prefix), "id = {}", id);
+        let suffix = &id[prefix.len()..];
+        assert_eq!(
+            suffix.len(),
+            16,
+            "suffix should be 16 hex chars: {}",
+            suffix
+        );
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "suffix not hex: {}",
+            suffix
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_detached_promise_is_created_on_server() {
+        let r = Resonate::local();
+        r.register(detacher_one).unwrap();
+
+        let id: String = r.run("e2e-det-exists", detacher_one, ()).await.unwrap();
+
+        // The detached promise must be reachable on the server.
+        let handle = r.get::<i64>(&id).await;
+        assert!(
+            handle.is_ok(),
+            "detached promise should exist: {:?}",
+            handle.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_detached_does_not_block_parent_completion() {
+        let r = Resonate::local();
+        r.register(detacher_one).unwrap();
+
+        // The detached promise targets a remote function nothing will resolve.
+        // The workflow must still complete promptly because it does not wait
+        // on detached children (no structured concurrency).
+        let id: String = tokio::time::timeout(
+            Duration::from_secs(5),
+            r.run("e2e-det-nb", detacher_one, ()),
+        )
+        .await
+        .expect("workflow should complete without waiting on detached promise")
+        .unwrap();
+        assert!(id.starts_with("e2e-det-nb."));
+    }
+
+    #[tokio::test]
+    async fn e2e_detached_is_idempotent_on_replay() {
+        let r = Resonate::local();
+        r.register(detacher_one).unwrap();
+
+        let id1: String = r.run("e2e-det-idem", detacher_one, ()).await.unwrap();
+        // Re-run same root id — replay must produce the same detached id.
+        let id2: String = r.run("e2e-det-idem", detacher_one, ()).await.unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn e2e_detached_multiple_calls_yield_distinct_ids() {
+        let r = Resonate::local();
+        r.register(detacher_many).unwrap();
+
+        let ids: Vec<String> = r.run("e2e-det-many", detacher_many, ()).await.unwrap();
+        assert_eq!(ids.len(), 3);
+        // Each call uses a distinct seq → distinct hash → distinct id.
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(ids[1], ids[2]);
+        assert_ne!(ids[0], ids[2]);
+        for id in &ids {
+            assert!(id.starts_with("e2e-det-many."));
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_detached_sets_global_scope_and_target_tags() {
+        let r = Resonate::local();
+        r.register(detacher_with_target).unwrap();
+
+        let id: String = r
+            .run("e2e-det-target", detacher_with_target, ())
+            .await
+            .unwrap();
+
+        let resp = r.transport().send_json(promise_get_req(&id)).await.unwrap();
+        let tags = &resp["data"]["promise"]["tags"];
+        assert_eq!(tags["resonate:scope"].as_str().unwrap(), "global");
+        assert_eq!(
+            tags["resonate:target"].as_str().unwrap(),
+            "local://any@custom-worker"
+        );
+        // Lineage is preserved: parent/origin point back to the workflow.
+        assert_eq!(tags["resonate:origin"].as_str().unwrap(), "e2e-det-target");
+        assert_eq!(tags["resonate:parent"].as_str().unwrap(), "e2e-det-target");
     }
 
     #[tokio::test]
